@@ -1,0 +1,28 @@
+# Build and Output
+build/
+bin/
+obj/
+*.exe
+*.dll
+*.obj
+*.pdb
+*.res
+*.lib
+*.exp
+
+# Dependencies
+deps/go-http-proxy-to-socks/
+# (Keeping other deps if they are source libs, but typically we ignore compiled stuff)
+
+# IDE / VS
+.vs/
+*.vcxproj*
+*.sln
+*.user
+
+# Go
+gohpts.exe
+
+# OS
+.DS_Store
+Thumbs.db

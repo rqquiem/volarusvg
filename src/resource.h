@@ -1,0 +1,1 @@
+#define IDR_GOHPTS_EXE 101
