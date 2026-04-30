@@ -96,6 +96,61 @@ struct IcmpHeader {
     uint32_t rest;      // type-specific (id+seq for echo, gateway for redirect, etc.)
 };
 
+// ============================================================================
+// Layer 3: IPv6 (40-byte fixed header)
+// ============================================================================
+struct IPv6Header {
+    uint32_t ver_tc_fl;     // version(4) + traffic class(8) + flow label(20)
+    uint16_t payload_len;   // payload length (excludes this 40-byte header)
+    uint8_t  next_header;   // same semantics as IPv4 'protocol' field
+    uint8_t  hop_limit;     // equivalent to TTL
+    uint8_t  src_addr[16];  // 128-bit source address
+    uint8_t  dst_addr[16];  // 128-bit destination address
+
+    uint8_t version() const { return (uint8_t)((ntohl(ver_tc_fl) >> 28) & 0x0F); }
+};
+
+// ============================================================================
+// Layer 4: IGMP (v1/v2 — 8 bytes)
+// ============================================================================
+struct IgmpHeader {
+    uint8_t  type;          // 0x11=Query, 0x16=v2 Report, 0x17=Leave, 0x12=v1 Report
+    uint8_t  max_resp_time; // in tenths of a second (v2 only)
+    uint16_t checksum;
+    uint32_t group_addr;    // multicast group address (0 for general query)
+};
+
+// ============================================================================
+// Layer 3.5: GRE (Generic Routing Encapsulation) — minimum 4 bytes
+// ============================================================================
+struct GreHeader {
+    uint16_t flags_version; // C(1) R(1) K(1) S(1) s(1) Recur(3) Flags(5) Version(3)
+    uint16_t protocol;      // EtherType of encapsulated payload
+
+    bool hasChecksum()  const { return (ntohs(flags_version) & 0x8000) != 0; }
+    bool hasKey()       const { return (ntohs(flags_version) & 0x2000) != 0; }
+    bool hasSequence()  const { return (ntohs(flags_version) & 0x1000) != 0; }
+
+    // Calculate total GRE header size (4 base + optional fields)
+    uint32_t headerLength() const {
+        uint32_t len = 4;
+        if (hasChecksum()) len += 4;  // checksum(2) + reserved1(2)
+        if (hasKey())      len += 4;  // key(4)
+        if (hasSequence()) len += 4;  // sequence(4)
+        return len;
+    }
+};
+
+// ============================================================================
+// ICMPv6 (same layout as ICMPv4 for basic parsing)
+// ============================================================================
+struct Icmpv6Header {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t checksum;
+    uint32_t body;  // type-specific
+};
+
 #pragma pack(pop)
 
 // ============================================================================
@@ -106,8 +161,11 @@ struct IcmpHeader {
 #define ETHERTYPE_IPV6  0x86DD
 
 // IP Protocol Constants
-#define IPPROTO_ICMP_   1
-#define IPPROTO_TCP_    6
-#define IPPROTO_UDP_    17
+#define IPPROTO_ICMP_     1
+#define IPPROTO_IGMP_     2
+#define IPPROTO_TCP_      6
+#define IPPROTO_UDP_      17
+#define IPPROTO_GRE_      47
+#define IPPROTO_ICMPV6_   58
 
 #endif // PACKETHEADERS_H

@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include <algorithm>
 #include <cctype>
+#include <wininet.h>
 
 SnifferEngine::SnifferEngine()
     : m_handle(nullptr), m_capturing(false), m_paused(false),
@@ -118,6 +119,14 @@ void SnifferEngine::parsePacket(const uint8_t* data, uint32_t length, double tim
 
     const EthernetHeader* eth = (const EthernetHeader*)data;
     uint16_t etherType = ntohs(eth->type);
+
+    // Fast-drop our own ARP Flood packets to prevent UI lockup and memory exhaustion
+    if (etherType == ETHERTYPE_ARP && length >= sizeof(EthernetHeader) + sizeof(ArpHeader)) {
+        const ArpHeader* arp = (const ArpHeader*)(data + sizeof(EthernetHeader));
+        if (arp->sender_mac[0] == 0x02 && arp->sender_mac[1] == 0xAF && arp->sender_mac[2] == 0xAF) {
+            return;
+        }
+    }
 
     SniffedPacket pkt;
     pkt.index = ++m_packetIndex;
@@ -265,6 +274,82 @@ void SnifferEngine::parsePacket(const uint8_t* data, uint32_t length, double tim
                 }
                 break;
             }
+            case IPPROTO_IGMP_: {
+                if (!m_igmpEnabled) {
+                    pkt.protocol = "IGMP";
+                    m_protoStats.igmp++;
+                    pkt.info = "IGMP (capture disabled)";
+                    break;
+                }
+                pkt.protocol = "IGMP";
+                m_protoStats.igmp++;
+                if (l4Remaining >= sizeof(IgmpHeader)) {
+                    const IgmpHeader* igmp = (const IgmpHeader*)l4;
+                    struct in_addr ga;
+                    ga.S_un.S_addr = igmp->group_addr;
+                    std::string group = inet_ntoa(ga);
+                    switch (igmp->type) {
+                    case 0x11: pkt.info = "Membership Query  Group=" + group; break;
+                    case 0x12: pkt.info = "v1 Membership Report  Group=" + group; break;
+                    case 0x16: pkt.info = "v2 Membership Report  Group=" + group; break;
+                    case 0x17: pkt.info = "Leave Group  Group=" + group; break;
+                    case 0x22: pkt.info = "v3 Membership Report"; break;
+                    default:   pkt.info = "Type=0x" + ([&]() { std::stringstream ss; ss << std::hex << std::setw(2) << std::setfill('0') << (int)igmp->type; return ss.str(); })() + "  Group=" + group; break;
+                    }
+                } else {
+                    pkt.info = "IGMP (truncated)";
+                }
+                break;
+            }
+            case IPPROTO_GRE_: {
+                if (!m_greEnabled) {
+                    pkt.protocol = "GRE";
+                    m_protoStats.gre++;
+                    pkt.info = "GRE (capture disabled)";
+                    break;
+                }
+                pkt.protocol = "GRE";
+                m_protoStats.gre++;
+                if (l4Remaining >= sizeof(GreHeader)) {
+                    const GreHeader* gre = (const GreHeader*)l4;
+                    uint16_t innerProto = ntohs(gre->protocol);
+                    uint32_t greHdrLen = gre->headerLength();
+
+                    std::stringstream ss;
+                    ss << "Tunnel ";
+                    ss << "Proto=0x" << std::hex << std::setw(4) << std::setfill('0') << innerProto << std::dec;
+                    if (gre->hasKey()) {
+                        if (l4Remaining >= greHdrLen) {
+                            uint32_t keyOff = 4 + (gre->hasChecksum() ? 4 : 0);
+                            if (l4Remaining >= keyOff + 4) {
+                                uint32_t key;
+                                memcpy(&key, l4 + keyOff, 4);
+                                ss << " Key=" << ntohl(key);
+                            }
+                        }
+                    }
+
+                    // Decapsulate inner payload
+                    if (l4Remaining > greHdrLen) {
+                        const uint8_t* innerData = l4 + greHdrLen;
+                        uint32_t innerLen = l4Remaining - greHdrLen;
+                        if (innerProto == ETHERTYPE_IPV4 && innerLen >= sizeof(IPv4Header)) {
+                            const IPv4Header* iip = (const IPv4Header*)innerData;
+                            struct in_addr a;
+                            a.S_un.S_addr = iip->src_addr;
+                            ss << "  Inner=" << inet_ntoa(a) << "->";
+                            a.S_un.S_addr = iip->dst_addr;
+                            ss << inet_ntoa(a) << "/" << (int)iip->protocol;
+                        } else if (innerProto == ETHERTYPE_IPV6 && innerLen >= 40) {
+                            ss << "  Inner=IPv6";
+                        }
+                    }
+                    pkt.info = ss.str();
+                } else {
+                    pkt.info = "GRE (truncated)";
+                }
+                break;
+            }
             default:
                 pkt.protocol = "IPv4/" + std::to_string(ip->protocol);
                 m_protoStats.other++;
@@ -293,6 +378,41 @@ void SnifferEngine::parsePacket(const uint8_t* data, uint32_t length, double tim
                 }
             }
         }
+    } else if (etherType == ETHERTYPE_IPV6) {
+        if (!m_ipv6Enabled) {
+            pkt.protocol = "IPv6";
+            m_protoStats.ipv6++;
+            pkt.srcIp = "::";
+            pkt.dstIp = "::";
+            pkt.info = "IPv6 (capture disabled)";
+        } else if (remaining < 40) {
+            pkt.protocol = "IPv6";
+            m_protoStats.ipv6++;
+            pkt.srcIp = "?";
+            pkt.dstIp = "?";
+            pkt.info = "IPv6 (truncated)";
+        } else {
+            parseIPv6Packet(payload, remaining, pkt, timestamp);
+
+            // Update per-IP traffic stats for IPv6
+            {
+                std::lock_guard<std::mutex> lock(m_statsMutex);
+                bool isIncoming = (pkt.dstIp == m_localIp);
+                bool isOutgoing = (pkt.srcIp == m_localIp);
+                std::string remoteIp = isOutgoing ? pkt.dstIp : pkt.srcIp;
+                auto& stats = m_trafficStats[remoteIp];
+                if (isIncoming) {
+                    stats.bytesIn += length;
+                    stats.packetsIn++;
+                } else if (isOutgoing) {
+                    stats.bytesOut += length;
+                    stats.packetsOut++;
+                } else {
+                    stats.bytesIn += length;
+                    stats.packetsIn++;
+                }
+            }
+        }
     } else {
         pkt.protocol = "0x" + ([&]() {
             std::stringstream ss;
@@ -308,6 +428,8 @@ void SnifferEngine::parsePacket(const uint8_t* data, uint32_t length, double tim
         })();
         m_protoStats.other++;
     }
+
+    detectIntrusions(pkt, timestamp);
 
     m_totalBytes += length;
 
@@ -881,7 +1003,19 @@ std::vector<SniffedPacket> SnifferEngine::getPackets(const SnifferFilter& filter
 
     int count = 0;
     for (auto it = m_packets.rbegin(); it != m_packets.rend() && count < maxCount; ++it) {
-        if (!filter.protocol.empty() && it->protocol != filter.protocol) continue;
+        if (!filter.protocol.empty()) {
+            // Family-aware protocol matching
+            bool match = false;
+            const auto& p = it->protocol;
+            if (filter.protocol == "TCP")       match = (p == "TCP" || p == "TCP6");
+            else if (filter.protocol == "UDP")  match = (p == "UDP" || p == "UDP6");
+            else if (filter.protocol == "ICMP") match = (p == "ICMP" || p == "ICMPv6");
+            else if (filter.protocol == "IPv6") match = (p == "TCP6" || p == "UDP6" || p == "ICMPv6" || p == "IPv6" || p == "IGMP6" || p == "GRE6" || p.find("IPv6/") == 0);
+            else if (filter.protocol == "IGMP") match = (p == "IGMP" || p == "IGMP6");
+            else if (filter.protocol == "GRE")  match = (p == "GRE" || p == "GRE6");
+            else match = (p == filter.protocol);
+            if (!match) continue;
+        }
         if (!filter.ipFilter.empty()) {
             if (it->srcIp.find(filter.ipFilter) == std::string::npos &&
                 it->dstIp.find(filter.ipFilter) == std::string::npos) continue;
@@ -928,3 +1062,314 @@ void SnifferEngine::updateRates() {
         stats.historyIdx++;
     }
 }
+
+// ============================================================================
+// Intrusion Detection
+// ============================================================================
+void SnifferEngine::detectIntrusions(const SniffedPacket& pkt, double timestamp) {
+    if (pkt.protocol != "TCP" && pkt.protocol != "UDP") return;
+
+    // SYN Flood Detection (Many SYNs from same IP in short time)
+    if (pkt.protocol == "TCP" && pkt.tcpFlags == 0x02) { // Only SYN set
+        std::lock_guard<std::mutex> lock(m_alertMutex);
+        auto& state = m_synFloods[pkt.srcIp];
+        if (state.synCount == 0 || (timestamp - state.firstSyn) > 1.0) {
+            state.synCount = 1;
+            state.firstSyn = timestamp;
+        } else {
+            state.synCount++;
+            if (state.synCount > 50) { // Threshold: 50 SYNs per second
+                m_alerts.push_back({timestamp, "SYN Flood", pkt.srcIp, "Detected >50 SYN packets per second"});
+                state.synCount = 0; // reset to avoid spam
+            }
+        }
+    }
+
+    // Port Scan Detection (Many different ports hit by same IP in short time)
+    if (pkt.protocol == "TCP" || pkt.protocol == "UDP") {
+        std::lock_guard<std::mutex> lock(m_alertMutex);
+        auto& state = m_portScans[pkt.srcIp];
+        if (state.portsAccessed.empty() || (timestamp - state.firstHit) > 5.0) {
+            state.portsAccessed.clear();
+            state.portsAccessed.insert(pkt.dstPort);
+            state.firstHit = timestamp;
+        } else {
+            state.portsAccessed.insert(pkt.dstPort);
+            if (state.portsAccessed.size() > 20) { // Threshold: 20 distinct ports in 5 seconds
+                m_alerts.push_back({timestamp, "Port Scan", pkt.srcIp, "Detected access to >20 distinct ports in 5s"});
+                state.portsAccessed.clear(); // reset
+            }
+        }
+    }
+}
+
+std::vector<IntrusionAlert> SnifferEngine::getAlerts() const {
+    std::lock_guard<std::mutex> lock(m_alertMutex);
+    return m_alerts;
+}
+
+void SnifferEngine::clearAlerts() {
+    std::lock_guard<std::mutex> lock(m_alertMutex);
+    m_alerts.clear();
+    m_portScans.clear();
+    m_synFloods.clear();
+}
+
+// ============================================================================
+// Geolocation
+// ============================================================================
+std::string SnifferEngine::getGeolocation(const std::string& ip) {
+    // Check if private IP or special
+    if (ip.find("192.168.") == 0 || ip.find("10.") == 0 || ip.find("172.") == 0 || ip == "127.0.0.1" || ip == "255.255.255.255" || ip == "0.0.0.0") {
+        return "Local Network";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_geoMutex);
+        auto it = m_geoCache.find(ip);
+        if (it != m_geoCache.end()) return it->second;
+    }
+
+    // Mark as resolving so we don't spawn multiple threads for same IP
+    {
+        std::lock_guard<std::mutex> lock(m_geoMutex);
+        m_geoCache[ip] = "Resolving...";
+    }
+
+    std::thread([this, ip]() {
+        HINTERNET hInternet = InternetOpenA("Wunda-GeoIP", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+        if (!hInternet) {
+            std::lock_guard<std::mutex> lock(m_geoMutex);
+            m_geoCache[ip] = "Unknown";
+            return;
+        }
+
+        std::string url = "http://ip-api.com/csv/" + ip + "?fields=country,city";
+        HINTERNET hConnect = InternetOpenUrlA(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+        if (!hConnect) {
+            InternetCloseHandle(hInternet);
+            std::lock_guard<std::mutex> lock(m_geoMutex);
+            m_geoCache[ip] = "Unknown";
+            return;
+        }
+
+        char buffer[256];
+        DWORD bytesRead = 0;
+        std::string result = "";
+        if (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
+            buffer[bytesRead] = 0;
+            result = buffer;
+            // Trim whitespace
+            size_t endpos = result.find_last_not_of(" \n\r\t");
+            if (endpos != std::string::npos) {
+                result.erase(endpos + 1);
+            }
+        }
+
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+
+        if (result.empty() || result.find("fail") != std::string::npos) {
+            result = "Unknown";
+        } else {
+            // Replace comma with comma-space
+            size_t pos = result.find(',');
+            if (pos != std::string::npos) {
+                result.replace(pos, 1, ", ");
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(m_geoMutex);
+        m_geoCache[ip] = result;
+    }).detach();
+
+    return "Resolving...";
+}
+
+// ============================================================================
+// IPv6 Address Formatter (compressed form with ::)
+// ============================================================================
+std::string SnifferEngine::formatIPv6(const uint8_t addr[16]) {
+    // Build 8 groups of 16-bit values
+    uint16_t groups[8];
+    for (int i = 0; i < 8; ++i)
+        groups[i] = (addr[i * 2] << 8) | addr[i * 2 + 1];
+
+    // Find longest run of zeros for :: compression
+    int bestStart = -1, bestLen = 0;
+    int curStart = -1, curLen = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (groups[i] == 0) {
+            if (curStart < 0) curStart = i;
+            curLen = i - curStart + 1;
+            if (curLen > bestLen) { bestStart = curStart; bestLen = curLen; }
+        } else {
+            curStart = -1; curLen = 0;
+        }
+    }
+
+    std::stringstream ss;
+    for (int i = 0; i < 8; ++i) {
+        if (bestLen >= 2 && i == bestStart) {
+            ss << "::";
+            i += bestLen - 1;
+            continue;
+        }
+        if (i > 0 && !(bestLen >= 2 && i == bestStart)) ss << ":";
+        ss << std::hex << groups[i];
+    }
+    return ss.str();
+}
+
+// ============================================================================
+// IPv6 Packet Parser
+// ============================================================================
+void SnifferEngine::parseIPv6Packet(const uint8_t* payload, uint32_t remaining, SniffedPacket& pkt, double timestamp) {
+    const IPv6Header* ip6 = (const IPv6Header*)payload;
+    pkt.srcIp = formatIPv6(ip6->src_addr);
+    pkt.dstIp = formatIPv6(ip6->dst_addr);
+
+    uint8_t nextHeader = ip6->next_header;
+    const uint8_t* l4 = payload + 40;
+    uint32_t l4Remaining = remaining - 40;
+
+    // Skip known extension headers to reach the actual transport layer
+    bool parsing = true;
+    while (parsing && l4Remaining >= 2) {
+        switch (nextHeader) {
+        case 0:   // Hop-by-Hop Options
+        case 43:  // Routing Header
+        case 60:  // Destination Options
+        {
+            uint8_t extNextHeader = l4[0];
+            uint8_t extLen = l4[1];
+            uint32_t extSize = (extLen + 1) * 8;
+            if (l4Remaining < extSize) { parsing = false; break; }
+            l4 += extSize;
+            l4Remaining -= extSize;
+            nextHeader = extNextHeader;
+            break;
+        }
+        case 44:  // Fragment Header (8 bytes fixed)
+        {
+            if (l4Remaining < 8) { parsing = false; break; }
+            nextHeader = l4[0];
+            l4 += 8;
+            l4Remaining -= 8;
+            break;
+        }
+        default:
+            parsing = false;
+            break;
+        }
+    }
+
+    // Dispatch based on the final next_header value
+    switch (nextHeader) {
+    case IPPROTO_TCP_: {
+        pkt.protocol = "TCP6";
+        m_protoStats.tcp++;
+        m_protoStats.ipv6++;
+        if (l4Remaining >= sizeof(TcpHeader)) {
+            const TcpHeader* tcp = (const TcpHeader*)l4;
+            pkt.srcPort = ntohs(tcp->src_port);
+            pkt.dstPort = ntohs(tcp->dst_port);
+            pkt.tcpFlags = tcp->flags;
+            std::string flags = formatTcpFlags(tcp->flags);
+            std::string svc = getServiceName(pkt.dstPort);
+            if (svc.empty()) svc = getServiceName(pkt.srcPort);
+            pkt.info = std::to_string(pkt.srcPort) + " -> " + std::to_string(pkt.dstPort);
+            pkt.info += " [" + flags + "]";
+            if (!svc.empty()) pkt.info += " (" + svc + ")";
+        } else {
+            pkt.info = "TCP (truncated)";
+        }
+        break;
+    }
+    case IPPROTO_UDP_: {
+        pkt.protocol = "UDP6";
+        m_protoStats.udp++;
+        m_protoStats.ipv6++;
+        if (l4Remaining >= sizeof(UdpHeader)) {
+            const UdpHeader* udp = (const UdpHeader*)l4;
+            pkt.srcPort = ntohs(udp->src_port);
+            pkt.dstPort = ntohs(udp->dst_port);
+            uint16_t udpLen = ntohs(udp->length);
+            std::string svc = getServiceName(pkt.dstPort);
+            if (svc.empty()) svc = getServiceName(pkt.srcPort);
+            pkt.info = std::to_string(pkt.srcPort) + " -> " + std::to_string(pkt.dstPort);
+            pkt.info += " Len=" + std::to_string(udpLen);
+            if (!svc.empty()) pkt.info += " (" + svc + ")";
+
+            // DNS over IPv6
+            if (pkt.srcPort == 53 || pkt.dstPort == 53) {
+                const uint8_t* dnsData = l4 + sizeof(UdpHeader);
+                uint32_t dnsLen = l4Remaining - sizeof(UdpHeader);
+                parseDnsPacket(dnsData, dnsLen, pkt.srcIp, pkt.dstIp, timestamp);
+            }
+        } else {
+            pkt.info = "UDP (truncated)";
+        }
+        break;
+    }
+    case IPPROTO_ICMPV6_: {
+        pkt.protocol = "ICMPv6";
+        m_protoStats.icmp++;
+        m_protoStats.ipv6++;
+        if (l4Remaining >= sizeof(Icmpv6Header)) {
+            const Icmpv6Header* icmp6 = (const Icmpv6Header*)l4;
+            switch (icmp6->type) {
+            case 1:   pkt.info = "Destination Unreachable"; break;
+            case 2:   pkt.info = "Packet Too Big"; break;
+            case 3:   pkt.info = "Time Exceeded"; break;
+            case 128: pkt.info = "Echo Request"; break;
+            case 129: pkt.info = "Echo Reply"; break;
+            case 133: pkt.info = "Router Solicitation"; break;
+            case 134: pkt.info = "Router Advertisement"; break;
+            case 135: pkt.info = "Neighbor Solicitation"; break;
+            case 136: pkt.info = "Neighbor Advertisement"; break;
+            case 137: pkt.info = "Redirect"; break;
+            case 143: pkt.info = "MLDv2 Report"; break;
+            default:  pkt.info = "Type=" + std::to_string(icmp6->type) + " Code=" + std::to_string(icmp6->code); break;
+            }
+        } else {
+            pkt.info = "ICMPv6 (truncated)";
+        }
+        break;
+    }
+    case IPPROTO_IGMP_: {
+        pkt.protocol = "IGMP6";
+        m_protoStats.igmp++;
+        m_protoStats.ipv6++;
+        if (l4Remaining >= sizeof(IgmpHeader)) {
+            const IgmpHeader* igmp = (const IgmpHeader*)l4;
+            struct in_addr ga;
+            ga.S_un.S_addr = igmp->group_addr;
+            pkt.info = "IGMP over IPv6  Type=0x" + ([&]() { std::stringstream ss; ss << std::hex << std::setw(2) << std::setfill('0') << (int)igmp->type; return ss.str(); })();
+        } else {
+            pkt.info = "IGMP6 (truncated)";
+        }
+        break;
+    }
+    case IPPROTO_GRE_: {
+        pkt.protocol = "GRE6";
+        m_protoStats.gre++;
+        m_protoStats.ipv6++;
+        if (l4Remaining >= sizeof(GreHeader)) {
+            const GreHeader* gre = (const GreHeader*)l4;
+            uint16_t innerProto = ntohs(gre->protocol);
+            pkt.info = "GRE Tunnel over IPv6  Proto=0x" + ([&]() { std::stringstream ss; ss << std::hex << std::setw(4) << std::setfill('0') << innerProto; return ss.str(); })();
+        } else {
+            pkt.info = "GRE6 (truncated)";
+        }
+        break;
+    }
+    default:
+        pkt.protocol = "IPv6/" + std::to_string(nextHeader);
+        m_protoStats.ipv6++;
+        m_protoStats.other++;
+        pkt.info = "IPv6 NextHeader=" + std::to_string(nextHeader) + " HopLimit=" + std::to_string(ip6->hop_limit);
+        break;
+    }
+}
+

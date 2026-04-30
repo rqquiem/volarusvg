@@ -22,6 +22,7 @@
 #include "KarmaEngine.h"
 #include "RawDeauthEngine.h"
 #include "ProxyBridgeEngine.h"
+#include "NmapEngine.h"
 
 // ============================================================================
 // Globals
@@ -40,6 +41,7 @@ SslStripEngine  g_sslStrip;
 KarmaEngine     g_karma;
 RawDeauthEngine g_rawDeauth;
 ProxyBridgeEngine g_proxyBridge;
+NmapEngine      g_nmap;
 
 static ID3D11Device*            g_pd3dDevice = nullptr;
 static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
@@ -128,11 +130,18 @@ static ImVec4 ColorDimCyan  = ImVec4(0.00f, 0.60f, 0.70f, 0.80f);
 static ImVec4 ColorWhite    = ImVec4(0.90f, 0.93f, 0.96f, 1.00f);
 static ImVec4 ColorDimWhite = ImVec4(0.50f, 0.55f, 0.60f, 1.00f);
 
+static ImVec4 ColorPurple = ImVec4(0.70f, 0.40f, 1.00f, 1.00f);
+static ImVec4 ColorTeal   = ImVec4(0.20f, 0.85f, 0.75f, 1.00f);
+static ImVec4 ColorBlue   = ImVec4(0.30f, 0.55f, 1.00f, 1.00f);
+
 static ImVec4 GetProtocolColor(const std::string& proto) {
-    if (proto == "TCP")  return ColorCyan;
-    if (proto == "UDP")  return ColorGreen;
-    if (proto == "ICMP") return ColorYellow;
-    if (proto == "ARP")  return ColorMagenta;
+    if (proto == "TCP" || proto == "TCP6")   return ColorCyan;
+    if (proto == "UDP" || proto == "UDP6")   return ColorGreen;
+    if (proto == "ICMP" || proto == "ICMPv6") return ColorYellow;
+    if (proto == "ARP")    return ColorMagenta;
+    if (proto == "IPv6")   return ColorPurple;
+    if (proto == "IGMP" || proto == "IGMP6")  return ColorTeal;
+    if (proto == "GRE" || proto == "GRE6")   return ColorBlue;
     return ColorDimWhite;
 }
 
@@ -187,8 +196,9 @@ static char g_evilTwinPassword[64] = "password123";
 static int g_selectedNetworkIdx = -1;
 
 // Sniffer filters
-static int g_filterProtocol = 0;  // 0=All, 1=TCP, 2=UDP, 3=ICMP, 4=ARP
+static int g_filterProtocol = 0;  // 0=All, 1=TCP, 2=UDP, 3=ICMP, 4=ARP, 5=IPv6, 6=IGMP, 7=GRE
 static char g_filterIp[64] = "";
+static bool g_hideFakeIps = true;
 static char g_filterPort[16] = "";
 
 // Per-device sliders (stored by IP)
@@ -205,7 +215,7 @@ static int PercentToKbps(int percent) {
     // linkSpeedBps is in bits/sec. Convert to KB/sec: bps / 8 / 1024
     int maxKbps = (int)(netInfo.linkSpeedBps / 8 / 1024);
     if (maxKbps <= 0) maxKbps = 12500;  // fallback 100 Mbps
-    if (percent <= 0) return 1;          // near-zero
+    if (percent <= 0) return 0;          // 0% = full CUT
     if (percent >= 100) return maxKbps;
     return (int)((double)maxKbps * percent / 100.0);
 }
@@ -273,6 +283,13 @@ static void RenderNetworkMap() {
         ImGui::TextColored(ColorDimCyan, "%s", netInfo.dns1.c_str());
     }
 
+    if (netInfo.isBonded) {
+        ImGui::SameLine(0, 15);
+        ImGui::TextColored(ColorDimWhite, "LAG:");
+        ImGui::SameLine();
+        ImGui::TextColored(ColorYellow, "%s", netInfo.bondMode.c_str());
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -332,6 +349,9 @@ static void RenderNetworkMap() {
             if (dev.ip == g_arp.getGatewayIp()) continue;
             if (dev.ip == g_arp.getLocalIp()) continue;
             g_arp.startVoidSpoofing(dev.ip, dev.mac);
+            // Also add ShaperEngine CUT policy as defense-in-depth
+            TrafficPolicy p; p.mode = TrafficMode::CUT;
+            g_shaper.setPolicy(dev.ip, p);
             g_arp.setDeviceFlags(dev.ip, true, true, false, false);
         }
     }
@@ -384,12 +404,66 @@ static void RenderNetworkMap() {
         if (g_arp.isTurboActive()) g_arp.stopTurboMode();
         if (g_arp.isAutoBlockActive()) g_arp.stopAutoBlock();
         if (g_arp.isShieldActive()) g_arp.stopShield();
+        if (g_arp.isDhcpStarvationActive()) g_arp.stopDhcpStarvation();
+        if (g_arp.isArpFloodActive()) g_arp.stopArpFlood();
         // Instant clear all shaper policies (no loop)
         g_shaper.clearAllPolicies();
         // Async ARP restoration (non-blocking)
         g_arp.resetAllPoison();
     }
     ImGui::PopStyleColor(2);
+
+    // DHCP Starvation button
+    ImGui::SameLine(0, 8);
+    if (g_arp.isDhcpStarvationActive()) {
+        float p = sinf(t * 3.0f) * 0.2f + 0.8f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(p, 0.0f, 0.0f, 0.9f));
+        if (ImGui::Button("  STARVATION ON  ", ImVec2(130, 32))) {
+            g_arp.stopDhcpStarvation();
+        }
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.0f, 0.1f, 0.7f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.6f, 0.0f, 0.2f, 0.9f));
+        if (ImGui::Button("  STARVE DHCP  ", ImVec2(130, 32))) {
+            g_arp.startDhcpStarvation();
+        }
+        ImGui::PopStyleColor(2);
+    }
+
+    // ARP Flood button
+    ImGui::SameLine(0, 8);
+    if (g_arp.isArpFloodActive()) {
+        float p = sinf(t * 5.0f) * 0.3f + 0.7f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(p, 0.0f, 0.0f, 0.9f));
+        if (ImGui::Button("  FLOODING ON  ", ImVec2(130, 32))) {
+            g_arp.stopArpFlood();
+        }
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.0f, 0.0f, 0.7f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.0f, 0.0f, 0.9f));
+        if (ImGui::Button("  ARP FLOOD  ", ImVec2(130, 32))) {
+            g_arp.startArpFlood();
+        }
+        ImGui::PopStyleColor(2);
+    }
+
+    // Clear Flood IPs button
+    ImGui::SameLine(0, 8);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.2f, 0.2f, 0.7f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.5f, 0.2f, 0.2f, 0.9f));
+    if (ImGui::Button(" CLEAR FLOOD IPs ", ImVec2(140, 32))) {
+        g_arp.clearFakeDevices();
+    }
+    ImGui::PopStyleColor(2);
+
+    ImGui::SameLine(0, 15);
+    ImGui::SetNextItemWidth(180);
+    int currentRate = g_arp.getArpFloodRate();
+    if (ImGui::SliderInt("##FloodRate", &currentRate, 1000, 1000000, "%d pkts/s", ImGuiSliderFlags_Logarithmic)) {
+        g_arp.setArpFloodRate(currentRate);
+    }
 
     // Status line
     ImGui::Spacing();
@@ -410,6 +484,24 @@ static void RenderNetworkMap() {
         ImGui::SameLine(0, 10);
         ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.4f, 1.0f), "[AUTO-BLOCK: %d blocked]", g_arp.getBlockedCount());
     }
+    if (netInfo.broadcastStormDetected) {
+        ImGui::SameLine(0, 10);
+        ImGui::TextColored(ColorRed, "[STORM: %d arp/s]", netInfo.arpStormCounter);
+    }
+    if (g_arp.isDhcpStarvationActive()) {
+        ImGui::SameLine(0, 10);
+        ImGui::TextColored(ColorRed, "[DHCP SENT: %d]", g_arp.getDhcpStarvePacketsSent());
+    }
+    if (g_arp.isArpFloodActive()) {
+        ImGui::SameLine(0, 10);
+        float p = sinf(t * 8.0f) * 0.4f + 0.6f;
+        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, p), "[ARP FLOOD ACTIVE]");
+    }
+    int conflictCount = g_arp.getIpConflictCount();
+    if (conflictCount > 0) {
+        ImGui::SameLine(0, 10);
+        ImGui::TextColored(ColorRed, "[%d IP CONFLICTS]", conflictCount);
+    }
     
     // ==================== ROW 2: BULK CONTROLS ====================
     ImGui::Spacing();
@@ -425,7 +517,7 @@ static void RenderNetworkMap() {
     if (ImGui::Button("THROTTLE ALL", ImVec2(100, 0))) {
         auto devices = g_arp.getDeviceList();
         for (auto& dev : devices) {
-            if (dev.ip == g_arp.getGatewayIp() || dev.ip == g_arp.getLocalIp()) continue;
+            if (dev.ip == g_arp.getGatewayIp() || dev.ip == g_arp.getLocalIp() || dev.isFake) continue;
             if (!dev.isPoisoned) continue;
             TrafficPolicy p;
             p.mode = TrafficMode::THROTTLE;
@@ -472,6 +564,9 @@ static void RenderNetworkMap() {
     }
     ImGui::PopStyleColor(2);
 
+    ImGui::SameLine(0, 20);
+    ImGui::Checkbox("Hide Flood IPs", &g_hideFakeIps);
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -495,6 +590,8 @@ static void RenderNetworkMap() {
 
         auto devices = g_arp.getDeviceList();
         for (auto& dev : devices) {
+            if (g_hideFakeIps && dev.isFake) continue;
+
             ImGui::TableNextRow();
             ImGui::PushID(dev.ip.c_str());
 
@@ -588,6 +685,9 @@ static void RenderNetworkMap() {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 0.8f));
                     if (ImGui::Button("CUT", ImVec2(75, 0))) {
                         g_arp.startVoidSpoofing(dev.ip, dev.mac);
+                        // Also add ShaperEngine CUT policy as defense-in-depth
+                        TrafficPolicy p; p.mode = TrafficMode::CUT;
+                        g_shaper.setPolicy(dev.ip, p);
                         g_arp.setDeviceFlags(dev.ip, true, true, false, false);
                     }
                     ImGui::PopStyleColor();
@@ -604,11 +704,16 @@ static void RenderNetworkMap() {
                 ImGui::SliderInt("##thr", &g_throttleSliders[dev.ip], 0, 100, "%d%%");
                 ImGui::SameLine();
                 if (ImGui::SmallButton("SET##t")) {
+                    int kbps = PercentToKbps(g_throttleSliders[dev.ip]);
                     TrafficPolicy p;
-                    p.mode = TrafficMode::THROTTLE;
-                    p.kbps = PercentToKbps(g_throttleSliders[dev.ip]);
+                    if (kbps <= 0) {
+                        p.mode = TrafficMode::CUT;
+                    } else {
+                        p.mode = TrafficMode::THROTTLE;
+                        p.kbps = kbps;
+                    }
                     g_shaper.setPolicy(dev.ip, p);
-                    g_arp.setDeviceFlags(dev.ip, true, false, true, false);
+                    g_arp.setDeviceFlags(dev.ip, true, (kbps <= 0), (kbps > 0), false);
                 }
             }
 
@@ -676,6 +781,61 @@ static void RenderPacketSniffer() {
             g_sniffer.clearCapture();
             g_selectedPacketIdx = -1;
         }
+
+        // ============ Protocol Capture Toggles ============
+        ImGui::SameLine(0, 20);
+        ImGui::TextColored(ColorDimWhite, "|");
+        ImGui::SameLine(0, 8);
+
+        // IPv6 toggle
+        {
+            bool on = g_sniffer.isIPv6Enabled();
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.20f, 0.80f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.30f, 0.95f, 0.95f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.10f, 0.30f, 0.50f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.15f, 0.45f, 0.70f));
+            }
+            if (ImGui::Button(on ? " IPv6 ON " : " IPv6 OFF", ImVec2(85, 32))) {
+                g_sniffer.setIPv6Enabled(!on);
+            }
+            ImGui::PopStyleColor(2);
+        }
+
+        // IGMP toggle
+        ImGui::SameLine(0, 4);
+        {
+            bool on = g_sniffer.isIGMPEnabled();
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.60f, 0.55f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.75f, 0.65f, 0.95f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.05f, 0.25f, 0.20f, 0.50f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.35f, 0.30f, 0.70f));
+            }
+            if (ImGui::Button(on ? " IGMP ON " : " IGMP OFF", ImVec2(85, 32))) {
+                g_sniffer.setIGMPEnabled(!on);
+            }
+            ImGui::PopStyleColor(2);
+        }
+
+        // GRE toggle
+        ImGui::SameLine(0, 4);
+        {
+            bool on = g_sniffer.isGREEnabled();
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.80f, 0.85f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.95f, 0.95f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.15f, 0.35f, 0.50f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.25f, 0.50f, 0.70f));
+            }
+            if (ImGui::Button(on ? "  GRE ON " : "  GRE OFF", ImVec2(85, 32))) {
+                g_sniffer.setGREEnabled(!on);
+            }
+            ImGui::PopStyleColor(2);
+        }
     }
 
     ImGui::SameLine(0, 20);
@@ -693,7 +853,7 @@ static void RenderPacketSniffer() {
     ImGui::TextColored(ColorDimWhite, "Filter:");
     ImGui::SameLine();
     
-    const char* protocols[] = { "All", "TCP", "UDP", "ICMP", "ARP" };
+    const char* protocols[] = { "All", "TCP", "UDP", "ICMP", "ARP", "IPv6", "IGMP", "GRE" };
     ImGui::SetNextItemWidth(80);
     ImGui::Combo("##proto", &g_filterProtocol, protocols, IM_ARRAYSIZE(protocols));
     ImGui::SameLine();
@@ -775,6 +935,9 @@ static void RenderPacketSniffer() {
                 // Source
                 ImGui::TableSetColumnIndex(2);
                 ImGui::TextColored(rowColor, "%s", pkt.srcIp.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Geo: %s", g_sniffer.getGeolocation(pkt.srcIp).c_str());
+                }
                 if (pkt.srcPort > 0) {
                     ImGui::SameLine(0, 0);
                     ImGui::TextColored(ColorDimWhite, ":%d", pkt.srcPort);
@@ -783,6 +946,9 @@ static void RenderPacketSniffer() {
                 // Destination
                 ImGui::TableSetColumnIndex(3);
                 ImGui::TextColored(rowColor, "%s", pkt.dstIp.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Geo: %s", g_sniffer.getGeolocation(pkt.dstIp).c_str());
+                }
                 if (pkt.dstPort > 0) {
                     ImGui::SameLine(0, 0);
                     ImGui::TextColored(ColorDimWhite, ":%d", pkt.dstPort);
@@ -955,6 +1121,9 @@ static void RenderTrafficStats() {
         DrawBar("UDP",   protoStats.udp,   ColorGreen);
         DrawBar("ICMP",  protoStats.icmp,  ColorYellow);
         DrawBar("ARP",   protoStats.arp,   ColorMagenta);
+        DrawBar("IPv6",  protoStats.ipv6,  ColorPurple);
+        DrawBar("IGMP",  protoStats.igmp,  ColorTeal);
+        DrawBar("GRE",   protoStats.gre,   ColorBlue);
         DrawBar("Other", protoStats.other,  ColorDimWhite);
     } else {
         ImGui::TextColored(ColorDimWhite, "No packets captured yet.");
@@ -1561,6 +1730,51 @@ static void RenderHttpDetailPopup() {
     ImGui::End();
 }
 
+// ============================================================================
+// Render: Tab 6 — INTRUSION ALERTS
+// ============================================================================
+static void RenderIntrusionAlerts() {
+    if (ImGui::Button("Clear Alerts", ImVec2(120, 30))) {
+        g_sniffer.clearAlerts();
+    }
+    ImGui::Spacing();
+    
+    auto alerts = g_sniffer.getAlerts();
+    if (alerts.empty()) {
+        ImGui::TextColored(ColorGreen, "No intrusions detected.");
+        return;
+    }
+
+    ImGuiTableFlags tFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                             ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+
+    if (ImGui::BeginTable("AlertsTable", 4, tFlags)) {
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Source IP", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        for (auto it = alerts.rbegin(); it != alerts.rend(); ++it) {
+            ImGui::TableNextRow();
+            
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%.4f", it->timestamp);
+            
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(ColorRed, "%s", it->type.c_str());
+            
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%s", it->srcIp.c_str());
+            
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%s", it->details.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
 static void RenderAdvanced() {
     float t = (float)ImGui::GetTime();
 
@@ -1591,6 +1805,11 @@ static void RenderAdvanced() {
 
     ImGui::PushStyleColor(ImGuiCol_Button, (curTab == 4) ? btnActive : btnNormal);
     if (ImGui::Button("  RAW WIFI DEAUTH  ", ImVec2(200, 30))) g_advSubTab = 4;
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 4);
+
+    ImGui::PushStyleColor(ImGuiCol_Button, (curTab == 5) ? btnActive : btnNormal);
+    if (ImGui::Button("  NMAP SCANNER  ", ImVec2(160, 30))) g_advSubTab = 5;
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
@@ -2314,6 +2533,51 @@ static void RenderAdvanced() {
         }
     }
 
+    // =====================================================================
+    // Sub-tab 5: NMAP SCANNER
+    // =====================================================================
+    if (g_advSubTab == 5) {
+        ImGui::TextColored(ImVec4(0.0f, 0.8f, 0.8f, 1.0f), "NMAP NETWORK SCANNER");
+        ImGui::Spacing();
+        
+        static char nmapTarget[128] = "192.168.1.1";
+        static char nmapFlags[128] = "-T4 -A -v";
+
+        ImGui::InputText("Target IP / Subnet", nmapTarget, sizeof(nmapTarget));
+        ImGui::InputText("Nmap Flags", nmapFlags, sizeof(nmapFlags));
+        
+        ImGui::Spacing();
+        if (g_nmap.isScanning()) {
+            float pulse = sinf(t * 5.0f) * 0.2f + 0.8f;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pulse * 0.8f, 0.0f, 0.0f, 1.0f));
+            if (ImGui::Button("STOP SCAN", ImVec2(150, 30))) {
+                g_nmap.stopScan();
+            }
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextColored(ColorYellow, "Scanning... Please wait.");
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.6f, 0.2f, 1.0f));
+            if (ImGui::Button("START SCAN", ImVec2(150, 30))) {
+                g_nmap.startScan(nmapTarget, nmapFlags);
+            }
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(ColorDimCyan, "Scanner Output:");
+        
+        ImGui::BeginChild("NmapOutput", ImVec2(0, 0), true);
+        ImGui::TextUnformatted(g_nmap.getFullOutput().c_str());
+        
+        // Auto scroll to bottom if scanning
+        if (g_nmap.isScanning() && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+    }
+
     // Render HTTP detail popup if open
     RenderHttpDetailPopup();
 }
@@ -2637,6 +2901,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             if (ImGui::BeginTabItem("  ADVANCED  ")) {
                 g_selectedTab = 4;
                 RenderAdvanced();
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("  INTRUSION ALERTS  ")) {
+                g_selectedTab = 5;
+                RenderIntrusionAlerts();
                 ImGui::EndTabItem();
             }
 

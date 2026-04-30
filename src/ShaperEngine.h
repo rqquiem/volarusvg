@@ -10,6 +10,8 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "windivert.h"
 
 // ============================================================================
@@ -80,6 +82,7 @@ public:
     void setLocalIp(const std::string& ip) { 
         std::lock_guard<std::mutex> lock(m_policyMutex);
         m_localIp = ip; 
+        inet_pton(AF_INET, ip.c_str(), &m_localIpNet);
     }
 
     // Legacy interface
@@ -107,6 +110,7 @@ private:
     mutable std::mutex m_policyMutex;
     
     std::string m_localIp;
+    UINT32 m_localIpNet = 0;
 
     // Delay queue
     std::deque<DelayedPacket> m_delayQueue;

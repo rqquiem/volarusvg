@@ -64,16 +64,19 @@ struct ProtocolStats {
     uint64_t udp   = 0;
     uint64_t icmp  = 0;
     uint64_t arp   = 0;
+    uint64_t ipv6  = 0;
+    uint64_t igmp  = 0;
+    uint64_t gre   = 0;
     uint64_t other = 0;
 
-    uint64_t total() const { return tcp + udp + icmp + arp + other; }
+    uint64_t total() const { return tcp + udp + icmp + arp + ipv6 + igmp + gre + other; }
 };
 
 // ============================================================================
 // Display-level filter
 // ============================================================================
 struct SnifferFilter {
-    std::string protocol;       // "" = all, "TCP", "UDP", "ICMP", "ARP"
+    std::string protocol;       // "" = all, "TCP", "UDP", "ICMP", "ARP", "IPv6", "IGMP", "GRE"
     std::string ipFilter;       // "" = all, else match src or dst
     uint16_t    portFilter = 0; // 0 = all
 };
@@ -110,6 +113,16 @@ struct DnsMapping {
 };
 
 // ============================================================================
+// Alerts & Geolocation
+// ============================================================================
+struct IntrusionAlert {
+    double timestamp;
+    std::string type; // "Port Scan", "SYN Flood", etc.
+    std::string srcIp;
+    std::string details;
+};
+
+// ============================================================================
 // Sniffer Engine
 // ============================================================================
 class SnifferEngine {
@@ -126,6 +139,14 @@ public:
 
     bool isCapturing() const { return m_capturing; }
     bool isPaused() const { return m_paused; }
+
+    // Protocol capture toggles (IPv6 / IGMP / GRE)
+    void setIPv6Enabled(bool v) { m_ipv6Enabled = v; }
+    void setIGMPEnabled(bool v) { m_igmpEnabled = v; }
+    void setGREEnabled(bool v)  { m_greEnabled = v; }
+    bool isIPv6Enabled() const  { return m_ipv6Enabled; }
+    bool isIGMPEnabled() const  { return m_igmpEnabled; }
+    bool isGREEnabled() const   { return m_greEnabled; }
 
     // Get filtered packet list (applies display filters)
     std::vector<SniffedPacket> getPackets(const SnifferFilter& filter, int maxCount = 500) const;
@@ -151,11 +172,18 @@ public:
     // Get all detected domains (for debug/display)
     size_t getTotalDomainsDetected() const;
 
+    // ============ Alerts & Geolocation ============
+    std::vector<IntrusionAlert> getAlerts() const;
+    void clearAlerts();
+    std::string getGeolocation(const std::string& ip);
+
 private:
     void captureLoop();
     void parsePacket(const uint8_t* data, uint32_t length, double timestamp);
+    void parseIPv6Packet(const uint8_t* payload, uint32_t remaining, SniffedPacket& pkt, double timestamp);
     std::string formatTcpFlags(uint8_t flags) const;
     std::string getServiceName(uint16_t port) const;
+    static std::string formatIPv6(const uint8_t addr[16]);
 
     // Activity detection
     void parseDnsPacket(const uint8_t* data, uint32_t len, const std::string& srcIp, const std::string& dstIp, double timestamp);
@@ -169,6 +197,11 @@ private:
     std::atomic<bool> m_paused;
     std::thread m_captureThread;
     std::string m_localIp;
+
+    // Protocol capture toggles
+    std::atomic<bool> m_ipv6Enabled{true};
+    std::atomic<bool> m_igmpEnabled{true};
+    std::atomic<bool> m_greEnabled{true};
 
     // Ring buffer of captured packets
     static const size_t MAX_PACKETS = 10000;
@@ -196,6 +229,30 @@ private:
     mutable std::mutex m_activityMutex;
     std::map<std::string, IPActivity> m_activityMap;    // IP → activity
     std::map<std::string, DnsMapping> m_dnsCache;       // resolved IP → domain name
+
+    // ============ Intrusion Detection Data ============
+    void detectIntrusions(const SniffedPacket& pkt, double timestamp);
+
+    mutable std::mutex m_alertMutex;
+    std::vector<IntrusionAlert> m_alerts;
+
+    // Port scan tracking
+    struct PortScanState {
+        std::set<uint16_t> portsAccessed;
+        double firstHit = 0.0;
+    };
+    std::map<std::string, PortScanState> m_portScans;
+
+    // SYN flood tracking
+    struct SynState {
+        int synCount = 0;
+        double firstSyn = 0.0;
+    };
+    std::map<std::string, SynState> m_synFloods;
+
+    // Geolocation cache
+    mutable std::mutex m_geoMutex;
+    std::map<std::string, std::string> m_geoCache;
 };
 
 #endif // SNIFFERENGINE_H

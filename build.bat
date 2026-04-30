@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
 :: --- CONFIGURATION ---
 set PROJECT_NAME=VolarusVanguard
@@ -25,7 +26,7 @@ set INCLUDES=/I%INC_DIR% /I%INC_DIR%\imgui /Ideps\npcap\Include /Isrc
 set LIBS=d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib iphlpapi.lib ws2_32.lib wininet.lib wlanapi.lib %LIB_DIR%\WinDivert.lib %LIB_DIR%\wpcap.lib %LIB_DIR%\Packet.lib
 
 :: --- SOURCE FILES ---
-set SOURCES=%SRC_DIR%\main.cpp %SRC_DIR%\ArpEngine.cpp %SRC_DIR%\ShaperEngine.cpp %SRC_DIR%\SnifferEngine.cpp %SRC_DIR%\SpeedTestEngine.cpp %SRC_DIR%\SslStripEngine.cpp %SRC_DIR%\KarmaEngine.cpp %SRC_DIR%\RawDeauthEngine.cpp %SRC_DIR%\ProxyBridgeEngine.cpp %SRC_DIR%\imgui.cpp %SRC_DIR%\imgui_draw.cpp %SRC_DIR%\imgui_widgets.cpp %SRC_DIR%\imgui_tables.cpp %SRC_DIR%\imgui_impl_win32.cpp %SRC_DIR%\imgui_impl_dx11.cpp
+set SOURCES=%SRC_DIR%\main.cpp %SRC_DIR%\ArpEngine.cpp %SRC_DIR%\ShaperEngine.cpp %SRC_DIR%\SnifferEngine.cpp %SRC_DIR%\SpeedTestEngine.cpp %SRC_DIR%\SslStripEngine.cpp %SRC_DIR%\KarmaEngine.cpp %SRC_DIR%\RawDeauthEngine.cpp %SRC_DIR%\ProxyBridgeEngine.cpp %SRC_DIR%\NmapEngine.cpp %SRC_DIR%\imgui.cpp %SRC_DIR%\imgui_draw.cpp %SRC_DIR%\imgui_widgets.cpp %SRC_DIR%\imgui_tables.cpp %SRC_DIR%\imgui_impl_win32.cpp %SRC_DIR%\imgui_impl_dx11.cpp
 
 :: --- FIND MSVC ---
 :: Check for VS 2022
@@ -63,7 +64,7 @@ rc /nologo /fo %OUT_DIR%\resources.res src\resources.rc
 
 :: --- BUILD ---
 echo [BUILD] Compiling %PROJECT_NAME%...
-cl %CXXFLAGS% %INCLUDES% %SOURCES% /Fe%OUT_DIR%\%PROJECT_NAME%.exe /link %LIBS% %OUT_DIR%\resources.res /SUBSYSTEM:WINDOWS
+cl %CXXFLAGS% %INCLUDES% %SOURCES% /Fe:%OUT_DIR%\%PROJECT_NAME%.exe /Fo:%OUT_DIR%\ /Fd:%OUT_DIR%\ /link %LIBS% %OUT_DIR%\resources.res /SUBSYSTEM:WINDOWS
 
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Compilation failed.
